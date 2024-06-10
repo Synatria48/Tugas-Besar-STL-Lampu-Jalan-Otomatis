@@ -6,28 +6,25 @@ Pastikan hanya memasukan library yang diperlukan
 #include <freertos/FreeRTOS.h>
 #include <Wire.h>
 #include "RTClib.h"
-#include <WiFi.h>
-#include <HTTPClient.h>
 
 /*
 Memberikan Task Handle agar bisa disesuaikan
 - Dapat menghapus
 - Dapat mengubah prioritas
 */
+TaskHandle_t TaskLEDHandle = NULL;
 TaskHandle_t TaskMonitoringHandle = NULL;
+TaskHandle_t TaskPushReportHandle = NULL;
+TaskHandle_t TaskRTCHandle = NULL;
 TaskHandle_t TaskReadLdrHandle = NULL;
 
 // Insiasi semaphore mutex & queue
 SemaphoreHandle_t interruptSemaphore;
+SemaphoreHandle_t mutex;
 QueueHandle_t ldrQueue;
 
 // Insisasi class RTC & http
 RTC_DS1307 rtc;
-HTTPClient http;
-
-// Define default value untuk WiFi
-#define WIFI_SSID "Wokwi-GUEST"
-#define WIFI_PASSWORD ""
 
 // Inisiasi PIN LED
 int LED1 = 19;
@@ -48,7 +45,7 @@ Define default value waktu awal dan akhir untuk logika RTC
 - strWaktuAkhir adalah waktu awal LED menyala (menandakan waktu malam)
 */
 const String strWaktuAwal = "05:30:00";
-const String strWaktuAkhir = "17:30:00";
+const String strWaktuAkhir = "19:30:00";
 
 /*
 Define default value state
@@ -62,7 +59,6 @@ bool forceOff = false;
 const float GAMMA = 0.7; 
 const float RL10 = 50;
 
-
 volatile unsigned long last_micros = 0;
 const long debouncing_time = 150000; // 150 ms dalam satuan microseconds
 
@@ -74,8 +70,12 @@ Fungsi Intterupt
 void debounceInterrupt() {
   unsigned long current_micros = micros();
   if((current_micros - last_micros) >= debouncing_time) {
-    forceOff = !forceOff;
-    xSemaphoreGiveFromISR(interruptSemaphore, NULL);
+    xSemaphoreTake(mutex, portMAX_DELAY); // Mengambil mutex
+
+    forceOff = !forceOff; // true -> false -> true
+
+    xSemaphoreGive(mutex); // Melepaskan mutex
+    xSemaphoreGiveFromISR(interruptSemaphore, NULL); // melepaskan semaphore
     last_micros = current_micros;
   }
 }
@@ -91,33 +91,6 @@ float readLDR(int data) {
   float resistance = 2000 * voltage / (1 - voltage / 5);
   return pow(RL10 * 1e3 * pow(10, GAMMA) / resistance, 1 / GAMMA);
 }
-
-// /*
-// Fungsi WiFi
-// - Bertujuan untuk melakukan aktifitas yang menggunakan internetworking
-// */
-// void connectingWifi() {
-//   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-//   Serial.print("Connecting to Wi-Fi");
-//   while (WiFi.status() != WL_CONNECTED)
-//   {
-//     Serial.print(".");
-//     delay(300);
-//   }
-//   Serial.println();
-//   Serial.print("Connected with IP: ");
-//   Serial.println(WiFi.localIP());
-// }
-
-// /*
-// Fungsi sendData
-// - bertujuan untuk mengirimkan data melalui protokol HTTP
-// - dapat membuat payload data sesuai kebutuhan
-// */
-// void sendData() {
-//   int httpCode = http.GET();
-//   Serial.println(httpCode);
-// }
 
 /*
 Insisasi Task
@@ -136,17 +109,10 @@ void setup() {
   // Menjalankan komunikasi serial
   Serial.begin(9600);
 
-  /*
-  - Menjalankan fungsi koneksi WiFi
-  - Menentukan Target API
-  */
-  //connectingWifi();
-  //http.begin("http://httpbin.org/get");
-
   // Menjalankan Sensor RTC (Real Time Clock)
   rtc.begin();
 
-  // Setup PIN LED sebagi output
+  // Setup PIN RELAY LED sebagi output
   pinMode(LED1, OUTPUT);
   pinMode(LED2, OUTPUT);
   pinMode(LED3, OUTPUT);
@@ -156,20 +122,21 @@ void setup() {
 
   // Setup Mutex untuk intterupt button forceOff
   interruptSemaphore = xSemaphoreCreateBinary();
+  mutex = xSemaphoreCreateMutex();
   attachInterrupt(digitalPinToInterrupt(BUTTON), debounceInterrupt, RISING);
 
   /*
   Setup Task berdasarakan Prioritas
-  - Prio 1 : Task_RTC & Task_ReadLDR
-  - Prio 2 : Task_LED
-  - Prio 3 : Task_Monitoring
-  - Prio 4 : Task_PushReport
+  - Prio 4 : Task_RTC & Task_ReadLDR
+  - Prio 3 : Task_LED
+  - Prio 2 : Task_Monitoring
+  - Prio 1 : Task_PushReport
   */
-  xTaskCreate(Task_LED, "Task_LED", 2048, NULL, 3, NULL);
-  xTaskCreate(TaskMonitoring, "Task_Monitoring", 2048, NULL, 2, &TaskMonitoringHandle);
-  xTaskCreate(TaskPushReport, "Task_PushReport", 2048, NULL, 1, NULL);
-  xTaskCreate(Task_RTC, "Task_RTC", 2048, NULL, 4, NULL);
-  xTaskCreate(Task_ReadLDR, "Task_ReadLDR", 2048, NULL, 4, &TaskReadLdrHandle);
+  xTaskCreate(Task_LED, "Task_LED", 1024, NULL, 3, &TaskLEDHandle);
+  xTaskCreate(TaskMonitoring, "Task_Monitoring", 1024, NULL, 2, &TaskMonitoringHandle); // dapat di manipulasi
+  xTaskCreate(TaskPushReport, "Task_PushReport", 1024, NULL, 1, &TaskPushReportHandle);
+  xTaskCreate(Task_RTC, "Task_RTC", 2048, NULL, 4, &TaskRTCHandle);
+  xTaskCreate(Task_ReadLDR, "Task_ReadLDR", 2048, NULL, 4, &TaskReadLdrHandle); // dapat di manipulasi
 }
 
 // fungsi ini tidak digunakan dalam FreeRTOS
@@ -177,14 +144,24 @@ void loop() {}
 
 /*
 Fungsi Task_LED
-- Betujuan untuk mengahndle semua aktifitas LED
+- Betujuan untuk menghandle semua aktifitas LED
 - Menerima data queue nilai LDR
 */
 void Task_LED(void* pvParameters) {
+  Serial.println("Task LED Created!");
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
+
   float ldrData[3];
   for (;;) {
     if (xQueueReceive(ldrQueue, &ldrData, portMAX_DELAY) == pdPASS) {
-      if (!forceOff) {
+      xSemaphoreTake(mutex, portMAX_DELAY); // Mengambil mutex
+
+      if (forceOff) {
+          Serial.println("Force Off!");
+          digitalWrite(LED1, LOW);
+          digitalWrite(LED2, LOW);
+          digitalWrite(LED3, LOW);
+      } else {
         if (siang) {
           digitalWrite(LED1, ldrData[0] < 200 ? HIGH : LOW);
           digitalWrite(LED2, ldrData[1] < 200 ? HIGH : LOW);
@@ -194,11 +171,9 @@ void Task_LED(void* pvParameters) {
           digitalWrite(LED2, HIGH);
           digitalWrite(LED3, HIGH);
         }
-      } else {
-          digitalWrite(LED1, LOW);
-          digitalWrite(LED2, LOW);
-          digitalWrite(LED3, LOW);
       }
+
+      xSemaphoreGive(mutex); // Melepaskan mutex
     }
     vTaskDelay(100 / portTICK_PERIOD_MS);
   }
@@ -212,23 +187,28 @@ Fungsi Task_RTC
 - Melakukan penghapusan dan pembuatan Task_Monitoring
 */
 void Task_RTC(void* pvParameters) {
+  Serial.println("Task RTC Created!");
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
+
   for (;;) {
     DateTime time = rtc.now();
     String currentTime = time.timestamp(DateTime::TIMESTAMP_TIME);
     siang = (currentTime >= strWaktuAwal && currentTime <= strWaktuAkhir);
 
-    if (!siang) {
-      vTaskPrioritySet(TaskReadLdrHandle, 1);
-      if (TaskMonitoringHandle == NULL) {
-          xTaskCreate(TaskMonitoring, "Task_Monitoring", 2048, NULL, 2, &TaskMonitoringHandle);
-      }
-    } else {
+    if (siang) {
+      vTaskPrioritySet(TaskReadLdrHandle, 4);
       if (TaskMonitoringHandle != NULL) {
         vTaskDelete(TaskMonitoringHandle);
         TaskMonitoringHandle = NULL;
       }
+    } else {
+      vTaskPrioritySet(TaskReadLdrHandle, 1);
+      if (TaskMonitoringHandle == NULL) {
+          xTaskCreate(TaskMonitoring, "Task_Monitoring", 1024, NULL, 2, &TaskMonitoringHandle);
+      }
     }
-    vTaskDelay(200 / portTICK_PERIOD_MS);
+
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
 
@@ -238,6 +218,9 @@ Fungsi TaskMonitoring
 - Berjalan 2 detik sekali
 */
 void TaskMonitoring(void* pvParameters) {
+  Serial.println("Task Monitoring Created!");
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
+
   for (;;) {
     Serial.print("LED1: ");
     Serial.print(digitalRead(LED1) == HIGH ? "ON" : "OFF");
@@ -255,6 +238,9 @@ Fungsi TaskPushReport
 - Proses HTTP request
 */
 void TaskPushReport(void* pvParameters) {
+  Serial.println("Task Push Report Created!");
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
+
   for (;;) {
     //sendData()
     Serial.println("Sending HTTP Reports!");
@@ -268,6 +254,9 @@ Fungsi Task_ReadLDR
 - Memasukkan data ke dalam queue secara berkala
 */
 void Task_ReadLDR(void* pvParameters) {
+  Serial.println("Task LDR Created!");
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
+
   float ldrData[3];
   for (;;) {
     ldrData[0] = readLDR(analogRead(LDR1));
